@@ -1,11 +1,38 @@
+use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use mini_redis::{Connection, Frame};
 use tokio::net::{TcpListener, TcpStream};
 
-type DB = Arc<Mutex<HashMap<String, Bytes>>>;
+#[derive(Clone)]
+struct SharedMap<K: Eq + Hash, V: Clone> {
+    inner: Arc<Mutex<HashMap<K, V>>>,
+}
+
+impl<K: Eq + Hash, V: Clone> SharedMap<K, V> {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn insert(&self, key: K, value: V) {
+        let mut lock = self.inner.lock().unwrap();
+        lock.insert(key, value);
+    }
+
+    fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let lock = self.inner.lock().unwrap();
+        lock.get(&key).cloned()
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -13,7 +40,7 @@ async fn main() {
 
     println!("Listening");
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    let db = SharedMap::new();
 
     loop {
         let (socket, _) = listener.accept().await.unwrap();
@@ -27,7 +54,7 @@ async fn main() {
     }
 }
 
-async fn process(socket: TcpStream, db: DB) {
+async fn process(socket: TcpStream, db: SharedMap<String, Bytes>) {
     use mini_redis::Command::{self, Get, Set};
 
     let mut connection = Connection::new(socket);
@@ -35,12 +62,10 @@ async fn process(socket: TcpStream, db: DB) {
     while let Some(frame) = connection.read_frame().await.unwrap() {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
-                let mut db = db.lock().unwrap();
                 db.insert(cmd.key().to_string(), cmd.value().clone());
                 Frame::Simple("OK".to_string())
             }
             Get(cmd) => {
-                let db = db.lock().unwrap();
                 if let Some(value) = db.get(cmd.key()) {
                     Frame::Bulk(value.clone().into())
                 } else {
